@@ -43,6 +43,9 @@ typedef struct {
 	GString *LeftFile;
 	GString *RightFile;
 	GString *CenterFile;
+	GString *LeftDisplay;
+	GString *RightDisplay;
+	GString *CenterDisplay;
 	GString *StorageDir;
 	GString *LeftFileStorage;
 	GString *CenterFileStorage;
@@ -139,9 +142,149 @@ static gboolean file_is_dir(BCompareExt *bcobj, char *filepath)
 	return isdir;
 }
 
+/* Resolves both the real, stat()-able filesystem path (for file_is_dir()) and
+ * the human-readable display string (for Beyond Compare's address bar) for a
+ * single Nautilus file. For file:// locations both values are identical: the
+ * plain filesystem path, unchanged from existing behavior. For any other
+ * scheme (smb://, sftp://, ...) the real path is the GVFS FUSE mount path
+ * when one is available (falling back to the raw URI otherwise), while the
+ * display value is always the original, clean URI.
+ *
+ * *real_out and *display_out are newly allocated and must be g_free()'d by
+ * the caller. Neither is ever NULL. */
+static void nautilus_resolve(
+		NautilusFileInfo *file,
+		gchar **real_out,
+		gchar **display_out)
+{
+	GFile *location = nautilus_file_info_get_location(file);
+	gchar *real_path = g_file_get_path(location);
+	gchar *uri = nautilus_file_info_get_uri(file);
+	gchar *scheme = nautilus_file_info_get_uri_scheme(file);
+
+	g_object_unref(location);
+
+	if (real_path == NULL) real_path = g_strdup(uri);
+
+	if ((scheme != NULL) && (strcmp(scheme, "file") == 0))
+		*display_out = g_strdup(real_path);
+	else
+		*display_out = g_strdup(uri);
+
+	*real_out = real_path;
+
+	g_free(uri);
+	g_free(scheme);
+}
+
+/* Thin wrapper for call sites that only need the real, stat()-able path. */
 static gchar * nautilus_to_path(NautilusFileInfo* file)
 {
-	return g_filename_from_uri(nautilus_file_info_get_uri(file), NULL, NULL);
+	gchar *real_path, *display;
+	nautilus_resolve(file, &real_path, &display);
+	g_free(display);
+	return real_path;
+}
+
+/* Replaces file_field/display_field with the real path/display value
+ * resolved from info, freeing whatever GStrings they previously held. */
+static void resolve_into(
+		GString **file_field,
+		GString **display_field,
+		NautilusFileInfo *info)
+{
+	gchar *real, *display;
+
+	if (*file_field != NULL) g_string_free(*file_field, TRUE);
+	if (*display_field != NULL) g_string_free(*display_field, TRUE);
+
+	nautilus_resolve(info, &real, &display);
+	*file_field = g_string_new(real);
+	*display_field = g_string_new(display);
+	g_free(real);
+	g_free(display);
+}
+
+/* Strips a single trailing '\n' (and a preceding '\r') from a fgets()-filled
+ * buffer, in place. */
+static void strip_eol(gchar *s)
+{
+	size_t len = strlen(s);
+	if ((len > 0) && (s[len - 1] == '\n')) s[--len] = '\0';
+	if ((len > 0) && (s[len - 1] == '\r')) s[--len] = '\0';
+}
+
+/* Writes real_value then display_value as two newline-terminated lines to
+ * storage_path. If real_value is NULL, truncates the file to empty (matches
+ * the historical "nothing selected" behavior). */
+static void write_selection_storage(
+		const gchar *storage_path,
+		const gchar *real_value,
+		const gchar *display_value)
+{
+	FILE *fileptr = g_fopen(storage_path, "w");
+	if (fileptr == NULL) return;
+
+	if (real_value != NULL) {
+		fputs(real_value, fileptr);
+		fputc('\n', fileptr);
+		fputs((display_value != NULL) ? display_value : real_value, fileptr);
+		fputc('\n', fileptr);
+	}
+	fclose(fileptr);
+}
+
+/* A single line read from a selection-storage file: caller supplies buf/
+ * bufsz, read_selection_line() fills value (pointing into buf) or leaves it
+ * NULL if the line is absent/empty. */
+typedef struct {
+	gchar *buf;
+	size_t bufsz;
+	gchar *value;
+} SelectionLine;
+
+/* Reads one newline-terminated line from fileptr into line->buf, strips the
+ * EOL, and sets line->value (or NULL if empty/EOF). If the line is longer
+ * than the buffer, drains the remainder up to the next '\n' so a subsequent
+ * read starts at the following line rather than mid-line. */
+static void read_selection_line(FILE *fileptr, SelectionLine *line)
+{
+	size_t len;
+	int c;
+
+	line->value = NULL;
+	if (fgets(line->buf, (int)line->bufsz, fileptr) == NULL) return;
+
+	len = strlen(line->buf);
+	if ((len == line->bufsz - 1) && (line->buf[len - 1] != '\n')) {
+		while (((c = fgetc(fileptr)) != EOF) && (c != '\n')) { }
+	}
+
+	strip_eol(line->buf);
+	if (line->buf[0] != '\0') line->value = line->buf;
+}
+
+/* Reads up to two newline-terminated lines from storage_path into
+ * real_line/display_line. Backward compatible with the old single-line
+ * format: the second read hits EOF immediately, leaving display_line->value
+ * NULL, so callers should fall back to real_line->value themselves. */
+static void read_selection_storage(
+		const gchar *storage_path,
+		SelectionLine *real_line,
+		SelectionLine *display_line)
+{
+	FILE *fileptr;
+
+	real_line->value = NULL;
+	display_line->value = NULL;
+
+	fileptr = fopen(storage_path, "r");
+	if (fileptr == NULL) return;
+
+	read_selection_line(fileptr, real_line);
+	if (real_line->value != NULL) read_selection_line(fileptr, display_line);
+
+	fclose(fileptr);
 }
 
 /*************************************************************
@@ -151,40 +294,40 @@ static gchar * nautilus_to_path(NautilusFileInfo* file)
  *************************************************************/
 static void select_left_action(BcMenuItem *item, BCompareExt *bcobj)
 {
-	GString *left_file;
-	FILE *fileptr;
+	GString *left_path, *left_display;
 
-	left_file =
+	left_path =
 		(GString *)g_object_get_data((GObject *)item, "bcext::left_path");
+	left_display =
+		(GString *)g_object_get_data((GObject *)item, "bcext::left_display");
+
 	g_mkdir_with_parents(bcobj->StorageDir->str, DIR_PERM);
-	fileptr = g_fopen(bcobj->LeftFileStorage->str, "w");
-	if (fileptr != NULL) {
-		if (left_file != NULL)
-			fputs(left_file->str, fileptr);
-		else fputs("", fileptr);
-		fclose(fileptr);
-	}
-	if (left_file != NULL) g_string_free(left_file, TRUE);
+	write_selection_storage(bcobj->LeftFileStorage->str,
+			(left_path != NULL) ? left_path->str : NULL,
+			(left_display != NULL) ? left_display->str : NULL);
+
+	if (left_path != NULL) g_string_free(left_path, TRUE);
+	if (left_display != NULL) g_string_free(left_display, TRUE);
 
 	alert_updated(bcobj);
 }
 
 static void select_center_action(BcMenuItem *item, BCompareExt *bcobj)
 {
-	GString *center_file;
-	FILE *fileptr;
+	GString *center_path, *center_display;
 
-	center_file =
-		(GString *)g_object_get_data((GObject *)item, "bcext::center_file");
+	center_path =
+		(GString *)g_object_get_data((GObject *)item, "bcext::center_path");
+	center_display =
+		(GString *)g_object_get_data((GObject *)item, "bcext::center_display");
+
 	g_mkdir_with_parents(bcobj->StorageDir->str, DIR_PERM);
-	fileptr = g_fopen(bcobj->CenterFileStorage->str, "w");
-	if (fileptr != NULL) {
-		if (center_file != NULL)
-			fputs(center_file->str, fileptr);
-		else fputs("", fileptr);
-		fclose(fileptr);
-	}
-	if (center_file != NULL) g_string_free(center_file, TRUE);
+	write_selection_storage(bcobj->CenterFileStorage->str,
+			(center_path != NULL) ? center_path->str : NULL,
+			(center_display != NULL) ? center_display->str : NULL);
+
+	if (center_path != NULL) g_string_free(center_path, TRUE);
+	if (center_display != NULL) g_string_free(center_display, TRUE);
 
 	alert_updated(bcobj);
 }
@@ -349,6 +492,8 @@ static BcMenuItem * select_left_mitem(
 		G_CALLBACK (select_left_action), bcobj);
 	g_object_set_data(
 	(GObject*)item, "bcext::left_path", g_string_new(bcobj->RightFile->str));
+	g_object_set_data(
+	(GObject*)item, "bcext::left_display", g_string_new(bcobj->RightDisplay->str));
 	g_object_set_data((GObject*)item, "bcext::is_dir", GBOOLEAN_TO_POINTER(IsDir));
 
 	g_string_free(MenuStr, TRUE);
@@ -370,7 +515,9 @@ static BcMenuItem * select_center_mitem(BCompareExt *bcobj)
 	g_signal_connect(item, "activate",
 			G_CALLBACK (select_center_action), bcobj);
 	g_object_set_data(
-	(GObject*)item, "bcext::center_file", g_string_new(bcobj->RightFile->str));
+	(GObject*)item, "bcext::center_path", g_string_new(bcobj->RightFile->str));
+	g_object_set_data(
+	(GObject*)item, "bcext::center_display", g_string_new(bcobj->RightDisplay->str));
 	return item;
 }
 
@@ -392,7 +539,7 @@ static BcMenuItem * edit_file_mitem(BCompareExt *bcobj)
 	g_signal_connect(item, "activate",
 			G_CALLBACK (edit_file_action), bcobj);
 	g_object_set_data(
-	(GObject*) item, "bcext::edit_file", g_string_new(bcobj->RightFile->str));
+	(GObject*) item, "bcext::edit_file", g_string_new(bcobj->RightDisplay->str));
 	g_string_free(MenuStr, TRUE);
 	return item;
 }
@@ -437,9 +584,9 @@ static BcMenuItem * compare_mitem(
 	g_signal_connect(item, "activate",
 			G_CALLBACK (compare_action), bcobj);
 	g_object_set_data(
-	(GObject*)item, "bcext::left_file", g_string_new(bcobj->LeftFile->str));
+	(GObject*)item, "bcext::left_file", g_string_new(bcobj->LeftDisplay->str));
 	g_object_set_data(
-	(GObject*)item, "bcext::right_file", g_string_new(bcobj->RightFile->str));
+	(GObject*)item, "bcext::right_file", g_string_new(bcobj->RightDisplay->str));
 	g_object_set_data((GObject*)item, "bcext::fileviewer", fileviewer);
 
 	g_string_free(MenuStr, TRUE);
@@ -478,9 +625,9 @@ static BcMenuItem * sync_mitem(
 	g_signal_connect(item, "activate",
 			G_CALLBACK (sync_action), bcobj);
 	g_object_set_data(
-			(GObject*)item, "bcext::left_folder", g_string_new(bcobj->LeftFile->str));
+			(GObject*)item, "bcext::left_folder", g_string_new(bcobj->LeftDisplay->str));
 	g_object_set_data(
-		(GObject*)item, "bcext::right_folder", g_string_new(bcobj->RightFile->str));
+		(GObject*)item, "bcext::right_folder", g_string_new(bcobj->RightDisplay->str));
 
 	g_string_free(MenuStr, TRUE);
 	g_string_free(HintStr, TRUE);
@@ -544,12 +691,12 @@ static BcMenuItem * merge_mitem(
 	g_signal_connect(item, "activate",
 			G_CALLBACK(merge_action), bcobj);
 	g_object_set_data(
-			(GObject*)item, "bcext::left_file", g_string_new(bcobj->LeftFile->str));
+			(GObject*)item, "bcext::left_file", g_string_new(bcobj->LeftDisplay->str));
 	g_object_set_data(
-			(GObject*)item, "bcext::right_file", g_string_new(bcobj->RightFile->str));
+			(GObject*)item, "bcext::right_file", g_string_new(bcobj->RightDisplay->str));
 	if (bcobj->CenterFile != NULL) {
 	g_object_set_data(
-			(GObject*)item, "bcext::center_file", g_string_new(bcobj->CenterFile->str));
+			(GObject*)item, "bcext::center_file", g_string_new(bcobj->CenterDisplay->str));
 	}
 
 	g_string_free(MenuStr, TRUE);
@@ -674,10 +821,12 @@ static GList * beyondcompare_get_file_items(
 	BcMenuItem *item;
 	GList *ret = NULL;
 	GList *tmp = NULL;
-	gchar leftfilepath[256];
-	gchar centerfilepath[256];
-	char *leftfileptr, *centerfileptr;
-	FILE *filestrptr;
+	gchar leftfilepath[4096];
+	gchar leftdisplaypath[4096];
+	gchar centerfilepath[4096];
+	gchar centerdisplaypath[4096];
+	SelectionLine leftfile_line, leftdisplay_line;
+	SelectionLine centerfile_line, centerdisplay_line;
 	int Cnt;
 	gboolean FirstIsDir;
 	int SelectedCnt;
@@ -697,57 +846,59 @@ static GList * beyondcompare_get_file_items(
 		}
 	}
 
-	leftfileptr = NULL;
-	filestrptr = fopen(bcobj->LeftFileStorage->str, "r");
-	if (filestrptr != NULL) {
-		leftfileptr = fgets(leftfilepath, 255, filestrptr);
-		fclose(filestrptr);
-	}
+	leftfile_line.buf = leftfilepath;
+	leftfile_line.bufsz = sizeof(leftfilepath);
+	leftdisplay_line.buf = leftdisplaypath;
+	leftdisplay_line.bufsz = sizeof(leftdisplaypath);
+	read_selection_storage(bcobj->LeftFileStorage->str,
+			&leftfile_line, &leftdisplay_line);
 
-	centerfileptr = NULL;
-	filestrptr = fopen(bcobj->CenterFileStorage->str, "r");
-	if (filestrptr != NULL) {
-		centerfileptr = fgets(centerfilepath, 255, filestrptr);
-		fclose(filestrptr);
-	}
+	centerfile_line.buf = centerfilepath;
+	centerfile_line.bufsz = sizeof(centerfilepath);
+	centerdisplay_line.buf = centerdisplaypath;
+	centerdisplay_line.bufsz = sizeof(centerdisplaypath);
+	read_selection_storage(bcobj->CenterFileStorage->str,
+			&centerfile_line, &centerdisplay_line);
 
 	if (SelectedCnt == 3) {
-		if (bcobj->CenterFile != NULL)
-			g_string_free(bcobj->CenterFile, TRUE);
-		bcobj->CenterFile = g_string_new(nautilus_to_path(
-			(NautilusFileInfo *)g_list_nth_data(files, 2)));
+		resolve_into(&bcobj->CenterFile, &bcobj->CenterDisplay,
+				(NautilusFileInfo *)g_list_nth_data(files, 2));
 	}
 	if (SelectedCnt >= 2) {
-		if (bcobj->LeftFile != NULL)
-			g_string_free(bcobj->LeftFile, TRUE);
-		bcobj->LeftFile = g_string_new(nautilus_to_path(
-			(NautilusFileInfo *)g_list_nth_data(files, 0)));
+		resolve_into(&bcobj->LeftFile, &bcobj->LeftDisplay,
+				(NautilusFileInfo *)g_list_nth_data(files, 0));
 
 		bcobj->LeftIsDir = FirstIsDir;
 
-		if (bcobj->RightFile != NULL)
-			g_string_free(bcobj->RightFile, TRUE);
-		bcobj->RightFile = g_string_new(nautilus_to_path(
-			(NautilusFileInfo *)g_list_nth_data(files, 1)));
+		resolve_into(&bcobj->RightFile, &bcobj->RightDisplay,
+				(NautilusFileInfo *)g_list_nth_data(files, 1));
 	}
 	if (SelectedCnt == 1) {
-		if (leftfileptr != NULL) {
+		if (leftfile_line.value != NULL) {
 			if (bcobj->LeftFile != NULL)
 				g_string_free(bcobj->LeftFile, TRUE);
-			bcobj->LeftFile = g_string_new(leftfileptr);
+			bcobj->LeftFile = g_string_new(leftfile_line.value);
 			bcobj->LeftIsDir =
 			  file_is_dir(bcobj, bcobj->LeftFile->str);
+
+			if (bcobj->LeftDisplay != NULL)
+				g_string_free(bcobj->LeftDisplay, TRUE);
+			bcobj->LeftDisplay = g_string_new((leftdisplay_line.value != NULL) ?
+					leftdisplay_line.value : leftfile_line.value);
 		}
 
-		if (bcobj->RightFile != NULL)
-			g_string_free(bcobj->RightFile, TRUE);
-		bcobj->RightFile = g_string_new(nautilus_to_path(
-			(NautilusFileInfo *)g_list_nth_data(files, 0)));
+		resolve_into(&bcobj->RightFile, &bcobj->RightDisplay,
+				(NautilusFileInfo *)g_list_nth_data(files, 0));
 
-		if (centerfileptr != NULL) {
+		if (centerfile_line.value != NULL) {
 			if (bcobj->CenterFile != NULL)
 				g_string_free(bcobj->CenterFile, TRUE);
-			bcobj->CenterFile = g_string_new(centerfileptr);
+			bcobj->CenterFile = g_string_new(centerfile_line.value);
+
+			if (bcobj->CenterDisplay != NULL)
+				g_string_free(bcobj->CenterDisplay, TRUE);
+			bcobj->CenterDisplay = g_string_new((centerdisplay_line.value != NULL) ?
+					centerdisplay_line.value : centerfile_line.value);
 		}
 	}
 
@@ -785,10 +936,16 @@ static GList * beyondcompare_get_file_items(
 	if (bcobj->LeftFile != NULL) g_string_free(bcobj->LeftFile, TRUE);
 	if (bcobj->RightFile != NULL) g_string_free(bcobj->RightFile, TRUE);
 	if (bcobj->CenterFile != NULL) g_string_free(bcobj->CenterFile, TRUE);
+	if (bcobj->LeftDisplay != NULL) g_string_free(bcobj->LeftDisplay, TRUE);
+	if (bcobj->RightDisplay != NULL) g_string_free(bcobj->RightDisplay, TRUE);
+	if (bcobj->CenterDisplay != NULL) g_string_free(bcobj->CenterDisplay, TRUE);
 
 	bcobj->LeftFile = NULL;
 	bcobj->RightFile = NULL;
 	bcobj->CenterFile = NULL;
+	bcobj->LeftDisplay = NULL;
+	bcobj->RightDisplay = NULL;
+	bcobj->CenterDisplay = NULL;
 
 	return ret;
 }
@@ -892,6 +1049,9 @@ bcompare_ext_init(BCompareExt *object)
 	object->LeftFile = NULL;
 	object->RightFile = NULL;
 	object->CenterFile = NULL;
+	object->LeftDisplay = NULL;
+	object->RightDisplay = NULL;
+	object->CenterDisplay = NULL;
 
 	object->StorageDir = g_string_new("");
 	g_string_printf(object->StorageDir, "%s", configdir);
