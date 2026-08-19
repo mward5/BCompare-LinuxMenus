@@ -139,9 +139,43 @@ static gboolean file_is_dir(BCompareExt *bcobj, char *filepath)
 	return isdir;
 }
 
+/* Resolves the real, stat()-able filesystem path for a selected item.
+ * g_filename_from_uri() only understands file:// URIs and returns NULL for
+ * anything GVFS-backed, so go through the GFile instead: for a GVFS location
+ * with an active FUSE mount this yields the /run/user/<uid>/gvfs/... path
+ * that file_is_dir() and bcompare both need. */
 static gchar * nautilus_to_path(NautilusFileInfo* file)
 {
-	return g_filename_from_uri(nautilus_file_info_get_uri(file), NULL, NULL);
+	GFile *location = nautilus_file_info_get_location(file);
+	gchar *path = g_file_get_path(location);
+
+	g_object_unref(location);
+	if (path == NULL) path = nautilus_file_info_get_uri(file);
+	return path;
+}
+
+/* Maps a real path to what bcompare should show in its address bar: the
+ * original URI for GVFS-backed locations (smb://server/share/... rather than
+ * the FUSE mount point), and the unchanged plain path for anything local. */
+static gchar * path_to_display(const gchar *path)
+{
+	GFile *location = g_file_new_for_commandline_arg(path);
+	gchar *uri = g_file_get_uri(location);
+
+	g_object_unref(location);
+	if ((uri == NULL) || g_str_has_prefix(uri, "file://")) {
+		g_free(uri);
+		return g_strdup(path);
+	}
+	return uri;
+}
+
+/* Display string for one bcompare argument, or "" when nothing is selected.
+ * Always returns a new string the caller must g_free(). */
+static gchar * display_arg(GString *path)
+{
+	if (path == NULL) return g_strdup("");
+	return path_to_display(path->str);
 }
 
 /*************************************************************
@@ -192,21 +226,23 @@ static void select_center_action(BcMenuItem *item, BCompareExt *bcobj)
 static void edit_file_action(BcMenuItem *item, BCompareExt *bcobj)
 {
 	GString *edit_file;
+	gchar *edit_disp;
 	char *argv[5];
 
 	edit_file =
 		(GString *)g_object_get_data((GObject *)item, "bcext::edit_file");
+	edit_disp = display_arg(edit_file);
+
 	argv[0] = "bcompare";
 	argv[1] = "bcompare";
 	argv[2] = "-edit";
-	if (edit_file != NULL)
-		argv[3] = edit_file->str;
-	else argv[3] = "";
+	argv[3] = edit_disp;
 	argv[4] = 0;
 
 	spawn_bc(argv);
 	clear_selections(bcobj);
 
+	g_free(edit_disp);
 	if (edit_file != NULL) g_string_free(edit_file, TRUE);
 }
 
@@ -214,6 +250,7 @@ static void compare_action(BcMenuItem *item, BCompareExt *bcobj)
 {
 	GString *left_file, *right_file;
 	GString *msg = g_string_new("");
+	gchar *left_disp, *right_disp;
 	char *fileviewer;
 	char *argv[6];
 	int cnt = 0;
@@ -225,24 +262,25 @@ static void compare_action(BcMenuItem *item, BCompareExt *bcobj)
 	fileviewer =
 		(char *)g_object_get_data((GObject *)item, "bcext::fileviewer");
 
+	left_disp = display_arg(left_file);
+	right_disp = display_arg(right_file);
+
 	argv[cnt++] = "bcompare";
 	argv[cnt++] = "bcompare";
 	if (strcmp(fileviewer, "") != 0) {
 		g_string_printf(msg, "-fv=\"%s\"", fileviewer);
 		argv[cnt++] = msg->str;
 	}
-	if (left_file != NULL)
-		argv[cnt++] = left_file->str;
-	else argv[cnt++] = "";
-	if (right_file != NULL)
-		argv[cnt++] = right_file->str;
-	else argv[cnt++] = "";
+	argv[cnt++] = left_disp;
+	argv[cnt++] = right_disp;
 	argv[cnt++] = 0;
 
 	spawn_bc(argv);
 	clear_selections(bcobj);
 
 	g_string_free(msg, TRUE);
+	g_free(left_disp);
+	g_free(right_disp);
 	if (left_file != NULL) g_string_free(left_file, TRUE);
 	if (right_file != NULL) g_string_free(right_file, TRUE);
 }
@@ -250,6 +288,7 @@ static void compare_action(BcMenuItem *item, BCompareExt *bcobj)
 static void sync_action(BcMenuItem *item, BCompareExt *bcobj)
 {
 	GString *left_folder, *right_folder;
+	gchar *left_disp, *right_disp;
 	char *argv[6];
 
 	left_folder =
@@ -257,20 +296,21 @@ static void sync_action(BcMenuItem *item, BCompareExt *bcobj)
 	right_folder =
 		(GString *)g_object_get_data((GObject *)item, "bcext::right_folder");
 
+	left_disp = display_arg(left_folder);
+	right_disp = display_arg(right_folder);
+
 	argv[0] = "bcompare";
 	argv[1] = "bcompare";
 	argv[2] = "-sync";
-	if (left_folder != NULL)
-		argv[3] = left_folder->str;
-	else argv[3] = "";
-	if (right_folder != NULL)
-		argv[4] = right_folder->str;
-	else argv[4] = "";
+	argv[3] = left_disp;
+	argv[4] = right_disp;
 	argv[5] = 0;
 
 	spawn_bc(argv);
 	clear_selections(bcobj);
 
+	g_free(left_disp);
+	g_free(right_disp);
 	if (left_folder != NULL) g_string_free(left_folder, TRUE);
 	if (right_folder != NULL) g_string_free(right_folder, TRUE);
 }
@@ -278,6 +318,7 @@ static void sync_action(BcMenuItem *item, BCompareExt *bcobj)
 static void merge_action(BcMenuItem *item, BCompareExt *bcobj)
 {
 	GString *left_file, *right_file, *center_file;
+	gchar *left_disp, *right_disp, *center_disp;
 	char *argv[7];
 
 	left_file =
@@ -287,23 +328,24 @@ static void merge_action(BcMenuItem *item, BCompareExt *bcobj)
 	center_file =
 		(GString *)g_object_get_data((GObject *)item, "bcext::center_file");
 
+	left_disp = display_arg(left_file);
+	right_disp = display_arg(right_file);
+	center_disp = display_arg(center_file);
+
 	argv[0] = "bcompare";
 	argv[1] = "bcompare";
 	argv[2] = "-fv=\"\"Text Merge\"\"";
-	if (left_file != NULL)
-		argv[3] = left_file->str;
-	else argv[3] = "";
-	if (right_file != NULL)
-		argv[4] = right_file->str;
-	else argv[4] = "";
-	if (center_file != NULL)
-		argv[5] = center_file->str;
-	else argv[5] = "";
+	argv[3] = left_disp;
+	argv[4] = right_disp;
+	argv[5] = center_disp;
 	argv[6] = 0;
 
 	spawn_bc(argv);
 	clear_selections(bcobj);
 
+	g_free(left_disp);
+	g_free(right_disp);
+	g_free(center_disp);
 	if (left_file != NULL) g_string_free(left_file, TRUE);
 	if (right_file != NULL) g_string_free(right_file, TRUE);
 	if (center_file != NULL) g_string_free(center_file, TRUE);
